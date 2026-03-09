@@ -1,0 +1,182 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secure-app
+  labels:
+    app: secure-app
+    version: v1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: secure-app
+  template:
+    metadata:
+      labels:
+        app: secure-app
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "app-role"
+        vault.hashicorp.com/agent-inject-secret-database: "database/creds/app-role"
+        vault.hashicorp.com/agent-inject-template-database: |
+          {{- with secret "database/creds/app-role" -}}
+          postgresql://{{ .Data.username }}:{{ .Data.password }}@{{ .Data.host }}:5432/appdb
+          {{- end }}
+    spec:
+      serviceAccountName: secure-app-sa
+      containers:
+      - name: app
+        image: secure-app:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+        - containerPort: 8001
+          name: metrics
+        env:
+        - name: ENVIRONMENT
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: LOG_LEVEL
+          value: "info"
+        - name: MAX_WORKERS
+          value: "4"
+        - name: DB_CONNECTION_STRING
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: database_url
+        - name: AWS_REGION
+          value: "us-east-1"
+        - name: DYNAMODB_TABLE_SESSIONS
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: dynamodb_sessions_table
+        - name: DYNAMODB_TABLE_EVENTS
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: dynamodb_events_table
+        - name: S3_BUCKET
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: s3_bucket
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: vault-secrets
+          mountPath: /vault/secrets
+          readOnly: true
+        - name: aws-credentials
+          mountPath: /home/appuser/.aws
+          readOnly: true
+      volumes:
+      - name: vault-secrets
+        emptyDir:
+          medium: Memory
+      - name: aws-credentials
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: "aws-secrets"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secure-app
+  labels:
+    app: secure-app
+spec:
+  selector:
+    app: secure-app
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8000
+  - name: metrics
+    port: 8001
+    targetPort: 8001
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  log_level: "info"
+  max_workers: "4"
+  dynamodb_sessions_table: "dev-app-sessions"
+  dynamodb_events_table: "dev-app-events"
+  s3_bucket: "dev-app-storage"
+  allowed_hosts: "localhost,secure-app"
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: secure-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: secure-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: secure-app-vpa
+spec:
+  targetRef:
+    apiVersion: "apps/v1"
+    kind: Deployment
+    name: secure-app
+  updatePolicy:
+    updateMode: "Auto"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "app"
+      minAllowed:
+        cpu: "200m"
+        memory: "200Mi"
+      maxAllowed:
+        cpu: "2"
+        memory: "2Gi"

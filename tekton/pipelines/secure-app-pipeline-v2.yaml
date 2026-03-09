@@ -1,0 +1,129 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: secure-app-pipeline-v2
+  namespace: tekton-pipelines
+spec:
+  workspaces:
+    - name: shared-source
+    - name: docker-config
+  params:
+    - name: repo-url
+      type: string
+      default: "https://github.com/yourorg/secure-app.git"
+    - name: revision
+      type: string
+      default: "main"
+    - name: image-name
+      type: string
+    - name: app-name
+      type: string
+      default: "secure-app"
+    - name: namespace
+      type: string
+      default: "production"
+    - name: environment
+      type: string
+      default: "dev"
+
+  tasks:
+    - name: fetch-source
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: source
+          workspace: shared-source
+      params:
+        - name: url
+          value: $(params.repo-url)
+        - name: revision
+          value: $(params.revision)
+
+    - name: iac-scan
+      taskRef:
+        name: checkov-scan
+      workspaces:
+        - name: source
+          workspace: shared-source
+      runAfter:
+        - fetch-source
+
+    - name: secure-build
+      taskRef:
+        name: kaniko-build
+      params:
+        - name: IMAGE
+          value: $(params.image-name)
+      workspaces:
+        - name: source
+          workspace: shared-source
+        - name: dockerconfig
+          workspace: docker-config
+      runAfter:
+        - iac-scan
+
+    - name: trivy-scan
+      taskRef:
+        name: trivy-scanner
+      params:
+        - name: image-url
+          value: $(params.image-name)
+        - name: severity
+          value: "CRITICAL,HIGH"
+      runAfter:
+        - secure-build
+
+    - name: generate-sbom
+      taskRef:
+        name: syft-sbom
+      params:
+        - name: image-url
+          value: $(params.image-name)
+        - name: output-format
+          value: "cyclonedx-json"
+      workspaces:
+        - name: output
+          workspace: shared-source
+      runAfter:
+        - trivy-scan
+
+    - name: sign-image
+      taskRef:
+        name: cosign-sign
+      params:
+        - name: image-url
+          value: $(params.image-name)
+      workspaces:
+        - name: source
+          workspace: shared-source
+      runAfter:
+        - generate-sbom
+
+    - name: deploy-to-cluster
+      taskRef:
+        name: kubernetes-actions
+      params:
+        - name: script
+          value: |
+            kubectl apply -f k8s/secrets/serviceaccount.yaml -n $(params.namespace)
+            envsubst < k8s/overlays/$(params.environment)/kustomization.yaml | kubectl apply -f -
+            kubectl rollout status deployment/secure-app -n $(params.namespace) --timeout=5m
+      workspaces:
+        - name: source
+          workspace: shared-source
+      runAfter:
+        - sign-image
+
+    - name: configure-falco
+      taskRef:
+        name: kubernetes-actions
+      params:
+        - name: script
+          value: |
+            kubectl apply -f security/falco/falco_rules.yaml -n $(params.namespace)
+            kubectl rollout restart ds/falco -n falco-system
+      workspaces:
+        - name: source
+          workspace: shared-source
+      runAfter:
+        - deploy-to-cluster

@@ -1,0 +1,29 @@
+- rule: App Database Access
+  desc: Detect database access from app
+  condition: >
+    container.image.repository endswith "secure-app" and
+    (proc.name = "postgres" or fd.name contains "postgresql")
+  output: >
+    Database access detected (user=%user.name command=%proc.cmdline)
+  priority: WARNING
+  tags: [database, app]
+
+- rule: AWS API Call
+  desc: Detect AWS API calls
+  condition: >
+    container.image.repository endswith "secure-app" and
+    (proc.name = "aws" or proc.name = "boto3")
+  output: >
+    AWS API call detected (user=%user.name command=%proc.cmdline)
+  priority: INFO
+  tags: [aws, api]
+
+- rule: Unauthorized Process
+  desc: Detect unauthorized processes in container
+  condition: >
+    container and
+    not proc.name in (package_manager, aws, python, bash, sh, curl, wget)
+  output: >
+    Unauthorized process started (user=%user.name command=%proc.cmdline)
+  priority: CRITICAL
+  tags: [security, process]

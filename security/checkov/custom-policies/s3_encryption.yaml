@@ -1,0 +1,17 @@
+metadata:
+  name: "S3 Bucket Encryption Required"
+  id: "CUSTOM_AWS_001"
+  category: "ENCRYPTION"
+definition:
+  and:
+    - cond_type: "attribute"
+      resource_types:
+        - "aws_s3_bucket"
+      attribute: "server_side_encryption_configuration"
+      operator: "exists"
+    - cond_type: "attribute"
+      resource_types:
+        - "aws_s3_bucket"
+      attribute: "server_side_encryption_configuration.rule.apply_server_side_encryption_by_default.sse_algorithm"
+      operator: "equals"
+      value: "AES256"

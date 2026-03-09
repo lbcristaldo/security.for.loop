@@ -1,0 +1,1694 @@
+#!/bin/bash
+
+set -e  # Salir si hay error
+
+# Directorio base temporal
+TEMP_DIR="/tmp/estructura-proyecto"
+PROJECT_DIR="$HOME/projects/security.for.loop"
+
+echo "Generando estructura de archivos en $TEMP_DIR"
+
+# Crear estructura temporal
+mkdir -p $TEMP_DIR
+
+# 1. DOCKER - Archivos de contenedorización
+cat > $TEMP_DIR/docker-compose.yaml << 'EOF'
+version: '3.8'
+services:
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=debug
+    volumes:
+      - ./src:/app/src
+    depends_on:
+      - postgres
+      - dynamodb-local
+    networks:
+      - app-network
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: development
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - app-network
+
+  dynamodb-local:
+    image: amazon/dynamodb-local
+    ports:
+      - "8000:8000"
+    command: -jar DynamoDBLocal.jar -sharedDb
+    volumes:
+      - dynamodb-data:/home/dynamodblocal/data
+    networks:
+      - app-network
+
+  vault:
+    image: vault:latest
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: root
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    cap_add:
+      - IPC_LOCK
+    volumes:
+      - vault-data:/vault/file
+    networks:
+      - app-network
+
+  falco:
+    image: falcosecurity/falco:latest
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/host/var/run/docker.sock
+      - /dev:/host/dev
+      - /proc:/host/proc:ro
+      - /boot:/host/boot:ro
+      - /lib/modules:/host/lib/modules:ro
+      - /usr:/host/usr:ro
+      - ./security/falco/falco_rules.yaml:/etc/falco/falco_rules.yaml
+    networks:
+      - app-network
+
+volumes:
+  postgres-data:
+  dynamodb-data:
+  vault-data:
+
+networks:
+  app-network:
+    driver: bridge
+EOF
+
+cat > $TEMP_DIR/Dockerfile << 'EOF'
+# syntax=docker/dockerfile:1.4
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+# Cache de dependencias
+COPY src/requirements.txt .
+RUN pip install --user -r requirements.txt && \
+    pip install --user gunicorn uvloop httptools
+
+FROM python:3.11-slim AS runtime
+
+# Variables de entorno no sensibles
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    ENVIRONMENT=production \
+    LOG_LEVEL=info \
+    PORT=8000
+
+WORKDIR /app
+
+# Crear usuario no-root
+RUN addgroup --system --gid 1001 appgroup && \
+    adduser --system --uid 1001 --gid 1001 appuser && \
+    mkdir -p /app/src && \
+    chown -R appuser:appgroup /app
+
+# Copiar dependencias del builder
+COPY --from=builder --chown=appuser:appgroup /root/.local /home/appuser/.local
+
+# Copiar código de la aplicación
+COPY --chown=appuser:appgroup src/app /app/src/
+COPY --chown=appuser:appgroup src/scripts /app/scripts/
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD python -c "import requests; requests.get('http://localhost:8000/health')" || exit 1
+
+USER appuser
+
+# Asegurar que las rutas de usuario estén en PATH
+ENV PATH="/home/appuser/.local/bin:${PATH}"
+
+EXPOSE 8000
+
+CMD ["gunicorn", "src.main:app", "--workers", "4", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000"]
+EOF
+
+# 2. SRC - Código de la aplicación
+mkdir -p $TEMP_DIR/src/{app,scripts,tests}
+
+# main.py
+cat > $TEMP_DIR/src/app/main.py << 'EOF'
+"""
+Aplicación principal con FastAPI
+Integración con PostgreSQL, DynamoDB y S3
+"""
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import logging
+import os
+import boto3
+import asyncpg
+from typing import Optional
+
+from src.app.api import router as api_router
+from src.app.core.config import settings
+from src.app.db.postgres import init_db as init_postgres
+from src.app.db.dynamodb import init_db as init_dynamodb
+
+# Configurar logging
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Manejo del ciclo de vida de la aplicación
+    """
+    # Startup
+    logger.info("Iniciando aplicación...")
+    
+    # Inicializar conexiones a bases de datos
+    try:
+        await init_postgres()
+        await init_dynamodb()
+        logger.info("Conexiones a bases de datos establecidas")
+    except Exception as e:
+        logger.error(f"Error conectando a bases de datos: {e}")
+        raise
+    
+    yield
+    
+    # Shutdown
+    logger.info("Cerrando aplicación...")
+    # Cerrar conexiones aquí si es necesario
+
+# Crear aplicación FastAPI
+app = FastAPI(
+    title="Secure App",
+    description="Aplicación con pipeline seguro",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Configurar CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Incluir routers
+app.include_router(api_router, prefix="/api/v1")
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Secure App API",
+        "environment": settings.ENVIRONMENT,
+        "version": "1.0.0"
+    }
+
+@app.get("/health")
+async def health():
+    """
+    Health check para Kubernetes
+    """
+    return {
+        "status": "healthy",
+        "database": "connected",
+        "dynamodb": "connected"
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+EOF
+
+# requirements.txt
+cat > $TEMP_DIR/src/requirements.txt << 'EOF'
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+gunicorn==21.2.0
+asyncpg==0.29.0
+boto3==1.34.0
+aioboto3==12.3.0
+python-decouple==3.8
+pydantic==2.5.0
+pydantic-settings==2.1.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6
+httpx==0.25.1
+prometheus-client==0.19.0
+structlog==24.1.0
+EOF
+
+# 3. IAC/Terraform - Módulos de infraestructura
+mkdir -p $TEMP_DIR/iac/terraform/{environments/dev,environments/prod,environments/staging,modules}
+
+# Módulo RDS
+cat > $TEMP_DIR/iac/terraform/modules/rds/main.tf << 'EOF'
+resource "aws_db_instance" "postgres" {
+  identifier = "${var.environment}-app-db"
+  
+  engine         = "postgres"
+  engine_version = "15.3"
+  instance_class = var.instance_class
+  
+  db_name  = "appdb"
+  username = var.db_username
+  password = random_password.db_password.result
+  
+  allocated_storage     = var.allocated_storage
+  storage_encrypted     = true
+  storage_type         = "gp3"
+  
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  
+  backup_retention_period = var.backup_retention
+  backup_window          = "03:00-04:00"
+  maintenance_window     = "sun:04:00-05:00"
+  
+  deletion_protection = var.environment == "prod" ? true : false
+  skip_final_snapshot = var.environment != "prod"
+  
+  enabled_cloudwatch_logs_exports = ["postgresql"]
+  
+  tags = {
+    Name        = "${var.environment}-app-db"
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+resource "random_password" "db_password" {
+  length  = 32
+  special = false
+}
+
+resource "aws_security_group" "rds" {
+  name        = "${var.environment}-rds-sg"
+  description = "Security group for RDS instance"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [var.app_security_group_id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name        = "${var.environment}-rds-sg"
+    Environment = var.environment
+  }
+}
+
+resource "aws_db_subnet_group" "main" {
+  name       = "${var.environment}-db-subnet-group"
+  subnet_ids = var.subnet_ids
+
+  tags = {
+    Name        = "${var.environment}-db-subnet-group"
+    Environment = var.environment
+  }
+}
+EOF
+
+cat > $TEMP_DIR/iac/terraform/modules/rds/variables.tf << 'EOF'
+variable "environment" {
+  description = "Environment name"
+  type        = string
+}
+
+variable "vpc_id" {
+  description = "VPC ID"
+  type        = string
+}
+
+variable "subnet_ids" {
+  description = "Subnet IDs for DB subnet group"
+  type        = list(string)
+}
+
+variable "app_security_group_id" {
+  description = "Security group ID of the application"
+  type        = string
+}
+
+variable "instance_class" {
+  description = "RDS instance class"
+  type        = string
+  default     = "db.t3.medium"
+}
+
+variable "allocated_storage" {
+  description = "Allocated storage in GB"
+  type        = number
+  default     = 100
+}
+
+variable "backup_retention" {
+  description = "Backup retention period in days"
+  type        = number
+  default     = 7
+}
+
+variable "db_username" {
+  description = "Database username"
+  type        = string
+  default     = "appuser"
+}
+EOF
+
+cat > $TEMP_DIR/iac/terraform/modules/rds/outputs.tf << 'EOF'
+output "endpoint" {
+  value = aws_db_instance.postgres.endpoint
+}
+
+output "port" {
+  value = aws_db_instance.postgres.port
+}
+
+output "database_name" {
+  value = aws_db_instance.postgres.db_name
+}
+
+output "username" {
+  value = aws_db_instance.postgres.username
+}
+
+output "password" {
+  value     = random_password.db_password.result
+  sensitive = true
+}
+
+output "security_group_id" {
+  value = aws_security_group.rds.id
+}
+EOF
+
+# Módulo DynamoDB
+cat > $TEMP_DIR/iac/terraform/modules/dynamodb/main.tf << 'EOF'
+resource "aws_dynamodb_table" "sessions" {
+  name           = "${var.environment}-app-sessions"
+  billing_mode   = "PAY_PER_REQUEST"
+  hash_key       = "session_id"
+  range_key      = "user_id"
+
+  attribute {
+    name = "session_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "user_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "expiry_time"
+    type = "N"
+  }
+
+  # GSI para búsqueda por usuario
+  global_secondary_index {
+    name            = "user_id-index"
+    hash_key        = "user_id"
+    projection_type = "ALL"
+  }
+
+  # TTL para sesiones expiradas
+  ttl {
+    attribute_name = "expiry_time"
+    enabled        = true
+  }
+
+  server_side_encryption {
+    enabled = true
+  }
+
+  point_in_time_recovery {
+    enabled = var.environment == "prod" ? true : false
+  }
+
+  tags = {
+    Name        = "${var.environment}-app-sessions"
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+resource "aws_dynamodb_table" "events" {
+  name           = "${var.environment}-app-events"
+  billing_mode   = "PAY_PER_REQUEST"
+  hash_key       = "event_id"
+  range_key      = "timestamp"
+
+  attribute {
+    name = "event_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "timestamp"
+    type = "S"
+  }
+
+  attribute {
+    name = "event_type"
+    type = "S"
+  }
+
+  # GSI para filtrar por tipo de evento
+  global_secondary_index {
+    name            = "event_type-index"
+    hash_key        = "event_type"
+    range_key       = "timestamp"
+    projection_type = "ALL"
+  }
+
+  server_side_encryption {
+    enabled = true
+  }
+
+  tags = {
+    Name        = "${var.environment}-app-events"
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+EOF
+
+cat > $TEMP_DIR/iac/terraform/modules/dynamodb/variables.tf << 'EOF'
+variable "environment" {
+  description = "Environment name"
+  type        = string
+}
+EOF
+
+cat > $TEMP_DIR/iac/terraform/modules/dynamodb/outputs.tf << 'EOF'
+output "sessions_table_name" {
+  value = aws_dynamodb_table.sessions.name
+}
+
+output "events_table_name" {
+  value = aws_dynamodb_table.events.name
+}
+
+output "sessions_table_arn" {
+  value = aws_dynamodb_table.sessions.arn
+}
+
+output "events_table_arn" {
+  value = aws_dynamodb_table.events.arn
+}
+EOF
+
+# Módulo S3
+cat > $TEMP_DIR/iac/terraform/modules/s3/main.tf << 'EOF'
+resource "aws_s3_bucket" "app_storage" {
+  bucket = "${var.environment}-app-storage-${data.aws_caller_identity.current.account_id}"
+
+  tags = {
+    Name        = "${var.environment}-app-storage"
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+resource "aws_s3_bucket_versioning" "main" {
+  bucket = aws_s3_bucket.app_storage.id
+  versioning_configuration {
+    status = var.environment == "prod" ? "Enabled" : "Suspended"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "main" {
+  bucket = aws_s3_bucket.app_storage.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "main" {
+  bucket = aws_s3_bucket.app_storage.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "main" {
+  bucket = aws_s3_bucket.app_storage.id
+
+  rule {
+    id     = "expire-old-files"
+    status = "Enabled"
+
+    expiration {
+      days = 365
+    }
+
+    transition {
+      days          = 90
+      storage_class = "STANDARD_IA"
+    }
+
+    transition {
+      days          = 270
+      storage_class = "GLACIER"
+    }
+  }
+}
+
+data "aws_caller_identity" "current" {}
+EOF
+
+cat > $TEMP_DIR/iac/terraform/modules/s3/variables.tf << 'EOF'
+variable "environment" {
+  description = "Environment name"
+  type        = string
+}
+EOF
+
+cat > $TEMP_DIR/iac/terraform/modules/s3/outputs.tf << 'EOF'
+output "bucket_name" {
+  value = aws_s3_bucket.app_storage.id
+}
+
+output "bucket_arn" {
+  value = aws_s3_bucket.app_storage.arn
+}
+
+output "bucket_domain_name" {
+  value = aws_s3_bucket.app_storage.bucket_domain_name
+}
+EOF
+
+# Módulo EKS
+cat > $TEMP_DIR/iac/terraform/modules/eks/main.tf << 'EOF'
+resource "aws_eks_cluster" "main" {
+  name     = "${var.environment}-app-cluster"
+  role_arn = aws_iam_role.eks_cluster.arn
+  version  = "1.28"
+
+  vpc_config {
+    subnet_ids              = var.subnet_ids
+    endpoint_private_access = true
+    endpoint_public_access  = var.environment != "prod" ? true : false
+    security_group_ids      = [aws_security_group.eks_cluster.id]
+  }
+
+  enabled_cluster_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+
+  encryption_config {
+    provider {
+      key_arn = aws_kms_key.eks.arn
+    }
+    resources = ["secrets"]
+  }
+
+  tags = {
+    Name        = "${var.environment}-app-cluster"
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_cluster_policy,
+    aws_iam_role_policy_attachment.eks_service_policy,
+  ]
+}
+
+resource "aws_eks_node_group" "main" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "${var.environment}-app-nodes"
+  node_role_arn   = aws_iam_role.eks_nodes.arn
+  subnet_ids      = var.subnet_ids
+
+  instance_types = var.instance_types
+
+  scaling_config {
+    desired_size = var.desired_size
+    max_size     = var.max_size
+    min_size     = var.min_size
+  }
+
+  update_config {
+    max_unavailable = 1
+  }
+
+  labels = {
+    environment = var.environment
+    app         = "main"
+  }
+
+  tags = {
+    Name        = "${var.environment}-app-nodes"
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_worker_node_policy,
+    aws_iam_role_policy_attachment.eks_cni_policy,
+    aws_iam_role_policy_attachment.ecr_read_only,
+  ]
+}
+
+# IAM Roles y Policies
+resource "aws_iam_role" "eks_cluster" {
+  name = "${var.environment}-eks-cluster-role"
+
+  assume_role_policy = jsonencode({
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "eks.amazonaws.com"
+      }
+    }]
+    Version = "2012-10-17"
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+  role       = aws_iam_role.eks_cluster.name
+}
+
+resource "aws_iam_role_policy_attachment" "eks_service_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSServicePolicy"
+  role       = aws_iam_role.eks_cluster.name
+}
+
+resource "aws_iam_role" "eks_nodes" {
+  name = "${var.environment}-eks-nodes-role"
+
+  assume_role_policy = jsonencode({
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+    }]
+    Version = "2012-10-17"
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "eks_worker_node_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+  role       = aws_iam_role.eks_nodes.name
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cni_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+  role       = aws_iam_role.eks_nodes.name
+}
+
+resource "aws_iam_role_policy_attachment" "ecr_read_only" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  role       = aws_iam_role.eks_nodes.name
+}
+
+# KMS Key for encryption
+resource "aws_kms_key" "eks" {
+  description             = "EKS Secret Encryption Key"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+
+  tags = {
+    Name        = "${var.environment}-eks-key"
+    Environment = var.environment
+  }
+}
+
+# Security Group
+resource "aws_security_group" "eks_cluster" {
+  name        = "${var.environment}-eks-cluster-sg"
+  description = "Security group for EKS cluster"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_cidr_blocks
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name        = "${var.environment}-eks-cluster-sg"
+    Environment = var.environment
+  }
+}
+EOF
+
+cat > $TEMP_DIR/iac/terraform/modules/eks/variables.tf << 'EOF'
+variable "environment" {
+  description = "Environment name"
+  type        = string
+}
+
+variable "vpc_id" {
+  description = "VPC ID"
+  type        = string
+}
+
+variable "subnet_ids" {
+  description = "Subnet IDs for EKS"
+  type        = list(string)
+}
+
+variable "instance_types" {
+  description = "EC2 instance types for node group"
+  type        = list(string)
+  default     = ["t3.medium"]
+}
+
+variable "desired_size" {
+  description = "Desired number of nodes"
+  type        = number
+  default     = 2
+}
+
+variable "max_size" {
+  description = "Maximum number of nodes"
+  type        = number
+  default     = 10
+}
+
+variable "min_size" {
+  description = "Minimum number of nodes"
+  type        = number
+  default     = 1
+}
+
+variable "allowed_cidr_blocks" {
+  description = "CIDR blocks allowed to access the cluster"
+  type        = list(string)
+  default     = ["10.0.0.0/8"]
+}
+EOF
+
+cat > $TEMP_DIR/iac/terraform/modules/eks/outputs.tf << 'EOF'
+output "cluster_id" {
+  value = aws_eks_cluster.main.id
+}
+
+output "cluster_endpoint" {
+  value = aws_eks_cluster.main.endpoint
+}
+
+output "cluster_security_group_id" {
+  value = aws_security_group.eks_cluster.id
+}
+
+output "kubeconfig_certificate_authority_data" {
+  value = aws_eks_cluster.main.certificate_authority[0].data
+}
+
+output "cluster_arn" {
+  value = aws_eks_cluster.main.arn
+}
+EOF
+
+# Environments
+cat > $TEMP_DIR/iac/terraform/environments/dev/main.tf << 'EOF'
+terraform {
+  required_version = ">= 1.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.0"
+    }
+  }
+
+  backend "s3" {
+    bucket         = "terraform-state-app-dev"
+    key            = "dev/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    dynamodb_table = "terraform-locks-dev"
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+
+  default_tags {
+    tags = {
+      Project     = "SecureApp"
+      Environment = "dev"
+      ManagedBy   = "Terraform"
+    }
+  }
+}
+
+# VPC (simplificada - en producción usar módulo VPC)
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = {
+    Name = "dev-app-vpc"
+  }
+}
+
+resource "aws_subnet" "private" {
+  count = 2
+
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.${count.index}.0/24"
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
+  tags = {
+    Name                              = "dev-private-subnet-${count.index}"
+    "kubernetes.io/role/internal-elb" = "1"
+    "kubernetes.io/cluster/dev-app-cluster" = "owned"
+  }
+}
+
+resource "aws_subnet" "public" {
+  count = 2
+
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.${count.index + 10}.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name                              = "dev-public-subnet-${count.index}"
+    "kubernetes.io/role/elb"          = "1"
+    "kubernetes.io/cluster/dev-app-cluster" = "owned"
+  }
+}
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+# Módulos
+module "rds" {
+  source = "../../modules/rds"
+
+  environment           = "dev"
+  vpc_id               = aws_vpc.main.id
+  subnet_ids           = aws_subnet.private[*].id
+  app_security_group_id = module.eks.cluster_security_group_id
+  instance_class        = "db.t3.small"
+  allocated_storage     = 20
+  backup_retention      = 7
+}
+
+module "dynamodb" {
+  source      = "../../modules/dynamodb"
+  environment = "dev"
+}
+
+module "s3" {
+  source      = "../../modules/s3"
+  environment = "dev"
+}
+
+module "eks" {
+  source = "../../modules/eks"
+
+  environment        = "dev"
+  vpc_id            = aws_vpc.main.id
+  subnet_ids        = concat(aws_subnet.private[*].id, aws_subnet.public[*].id)
+  instance_types    = ["t3.medium"]
+  desired_size      = 2
+  max_size          = 5
+  min_size          = 1
+  allowed_cidr_blocks = ["0.0.0.0/0"]
+}
+
+output "rds_endpoint" {
+  value = module.rds.endpoint
+}
+
+output "dynamodb_tables" {
+  value = {
+    sessions = module.dynamodb.sessions_table_name
+    events   = module.dynamodb.events_table_name
+  }
+}
+
+output "s3_bucket" {
+  value = module.s3.bucket_name
+}
+
+output "eks_cluster_endpoint" {
+  value = module.eks.cluster_endpoint
+  sensitive = true
+}
+EOF
+
+# 4. K8S Manifests
+mkdir -p $TEMP_DIR/k8s/{base,overlays,secrets}
+
+# Base deployment
+cat > $TEMP_DIR/k8s/base/deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secure-app
+  labels:
+    app: secure-app
+    version: v1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: secure-app
+  template:
+    metadata:
+      labels:
+        app: secure-app
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "app-role"
+        vault.hashicorp.com/agent-inject-secret-database: "database/creds/app-role"
+        vault.hashicorp.com/agent-inject-template-database: |
+          {{- with secret "database/creds/app-role" -}}
+          postgresql://{{ .Data.username }}:{{ .Data.password }}@{{ .Data.host }}:5432/appdb
+          {{- end }}
+    spec:
+      serviceAccountName: secure-app-sa
+      containers:
+      - name: app
+        image: secure-app:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+        - containerPort: 8001
+          name: metrics
+        env:
+        - name: ENVIRONMENT
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: LOG_LEVEL
+          value: "info"
+        - name: MAX_WORKERS
+          value: "4"
+        - name: DB_CONNECTION_STRING
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: database_url
+        - name: AWS_REGION
+          value: "us-east-1"
+        - name: DYNAMODB_TABLE_SESSIONS
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: dynamodb_sessions_table
+        - name: DYNAMODB_TABLE_EVENTS
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: dynamodb_events_table
+        - name: S3_BUCKET
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: s3_bucket
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: vault-secrets
+          mountPath: /vault/secrets
+          readOnly: true
+        - name: aws-credentials
+          mountPath: /home/appuser/.aws
+          readOnly: true
+      volumes:
+      - name: vault-secrets
+        emptyDir:
+          medium: Memory
+      - name: aws-credentials
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: "aws-secrets"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secure-app
+  labels:
+    app: secure-app
+spec:
+  selector:
+    app: secure-app
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8000
+  - name: metrics
+    port: 8001
+    targetPort: 8001
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  log_level: "info"
+  max_workers: "4"
+  dynamodb_sessions_table: "dev-app-sessions"
+  dynamodb_events_table: "dev-app-events"
+  s3_bucket: "dev-app-storage"
+  allowed_hosts: "localhost,secure-app"
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: secure-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: secure-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: secure-app-vpa
+spec:
+  targetRef:
+    apiVersion: "apps/v1"
+    kind: Deployment
+    name: secure-app
+  updatePolicy:
+    updateMode: "Auto"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "app"
+      minAllowed:
+        cpu: "200m"
+        memory: "200Mi"
+      maxAllowed:
+        cpu: "2"
+        memory: "2Gi"
+EOF
+
+# ServiceAccount
+cat > $TEMP_DIR/k8s/secrets/serviceaccount.yaml << 'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: secure-app-sa
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::123456789:role/secure-app-role"
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "app-role"
+---
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: aws-secrets
+spec:
+  provider: aws
+  parameters:
+    objects: |
+      - objectName: "db-password"
+        objectType: "secretsmanager"
+        jmesPath:
+          - path: "password"
+            objectAlias: "db_password"
+      - objectName: "aws-credentials"
+        objectType: "secretsmanager"
+        jmesPath:
+          - path: "access_key"
+            objectAlias: "aws_access_key_id"
+          - path: "secret_key"
+            objectAlias: "aws_secret_access_key"
+EOF
+
+# 5. Security - Configuraciones
+mkdir -p $TEMP_DIR/security/{vault,cosign,falco,checkov/custom-policies}
+
+# Vault config
+cat > $TEMP_DIR/security/vault/vault-config.json << 'EOF'
+{
+  "backend": {
+    "file": {
+      "path": "/vault/file"
+    }
+  },
+  "listener": {
+    "tcp": {
+      "address": "0.0.0.0:8200",
+      "tls_disable": true
+    }
+  },
+  "ui": true,
+  "api_addr": "http://127.0.0.1:8200"
+}
+EOF
+
+cat > $TEMP_DIR/security/vault/vault-policies.hcl << 'EOF'
+# Política para la aplicación
+path "database/creds/app-role" {
+  capabilities = ["read"]
+}
+
+path "secret/data/app/*" {
+  capabilities = ["read"]
+}
+
+# Política para renovación de leases
+path "sys/leases/renew" {
+  capabilities = ["update"]
+}
+
+path "sys/leases/revoke" {
+  capabilities = ["update"]
+}
+EOF
+
+# Falco rules
+cat > $TEMP_DIR/security/falco/falco_rules.yaml << 'EOF'
+- rule: App Database Access
+  desc: Detect database access from app
+  condition: >
+    container.image.repository endswith "secure-app" and
+    (proc.name = "postgres" or fd.name contains "postgresql")
+  output: >
+    Database access detected (user=%user.name command=%proc.cmdline)
+  priority: WARNING
+  tags: [database, app]
+
+- rule: AWS API Call
+  desc: Detect AWS API calls
+  condition: >
+    container.image.repository endswith "secure-app" and
+    (proc.name = "aws" or proc.name = "boto3")
+  output: >
+    AWS API call detected (user=%user.name command=%proc.cmdline)
+  priority: INFO
+  tags: [aws, api]
+
+- rule: Unauthorized Process
+  desc: Detect unauthorized processes in container
+  condition: >
+    container and
+    not proc.name in (package_manager, aws, python, bash, sh, curl, wget)
+  output: >
+    Unauthorized process started (user=%user.name command=%proc.cmdline)
+  priority: CRITICAL
+  tags: [security, process]
+EOF
+
+# Checkov custom policies
+cat > $TEMP_DIR/security/checkov/custom-policies/s3_encryption.yaml << 'EOF'
+metadata:
+  name: "S3 Bucket Encryption Required"
+  id: "CUSTOM_AWS_001"
+  category: "ENCRYPTION"
+definition:
+  and:
+    - cond_type: "attribute"
+      resource_types:
+        - "aws_s3_bucket"
+      attribute: "server_side_encryption_configuration"
+      operator: "exists"
+    - cond_type: "attribute"
+      resource_types:
+        - "aws_s3_bucket"
+      attribute: "server_side_encryption_configuration.rule.apply_server_side_encryption_by_default.sse_algorithm"
+      operator: "equals"
+      value: "AES256"
+EOF
+
+# 6. Tekton Pipelines
+mkdir -p $TEMP_DIR/tekton/{pipelines,tasks,runs,triggers}
+
+cat > $TEMP_DIR/tekton/pipelines/secure-app-pipeline-v2.yaml << 'EOF'
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: secure-app-pipeline-v2
+  namespace: tekton-pipelines
+spec:
+  workspaces:
+    - name: shared-source
+    - name: docker-config
+  params:
+    - name: repo-url
+      type: string
+      default: "https://github.com/yourorg/secure-app.git"
+    - name: revision
+      type: string
+      default: "main"
+    - name: image-name
+      type: string
+    - name: app-name
+      type: string
+      default: "secure-app"
+    - name: namespace
+      type: string
+      default: "production"
+    - name: environment
+      type: string
+      default: "dev"
+      
+  tasks:
+    - name: fetch-source
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: source
+          workspace: shared-source
+      params:
+        - name: url
+          value: $(params.repo-url)
+        - name: revision
+          value: $(params.revision)
+    
+    - name: iac-scan
+      taskRef:
+        name: checkov-scan
+      workspaces:
+        - name: source
+          workspace: shared-source
+      runAfter:
+        - fetch-source
+    
+    - name: secure-build
+      taskRef:
+        name: kaniko-build
+      params:
+        - name: IMAGE
+          value: $(params.image-name)
+      workspaces:
+        - name: source
+          workspace: shared-source
+        - name: dockerconfig
+          workspace: docker-config
+      runAfter:
+        - iac-scan
+    
+    - name: trivy-scan
+      taskRef:
+        name: trivy-scanner
+      params:
+        - name: image-url
+          value: $(params.image-name)
+        - name: severity
+          value: "CRITICAL,HIGH"
+      runAfter:
+        - secure-build
+    
+    - name: generate-sbom
+      taskRef:
+        name: syft-sbom
+      params:
+        - name: image-url
+          value: $(params.image-name)
+        - name: output-format
+          value: "cyclonedx-json"
+      workspaces:
+        - name: output
+          workspace: shared-source
+      runAfter:
+        - trivy-scan
+    
+    - name: sign-image
+      taskRef:
+        name: cosign-sign
+      params:
+        - name: image-url
+          value: $(params.image-name)
+      workspaces:
+        - name: source
+          workspace: shared-source
+      runAfter:
+        - generate-sbom
+    
+    - name: deploy-to-cluster
+      taskRef:
+        name: kubernetes-actions
+      params:
+        - name: script
+          value: |
+            # Aplicar configuraciones
+            kubectl apply -f k8s/secrets/serviceaccount.yaml -n $(params.namespace)
+            
+            # Desplegar aplicación
+            envsubst < k8s/overlays/$(params.environment)/kustomization.yaml | kubectl apply -f -
+            
+            # Verificar despliegue
+            kubectl rollout status deployment/secure-app -n $(params.namespace) --timeout=5m
+      workspaces:
+        - name: source
+          workspace: shared-source
+      runAfter:
+        - sign-image
+    
+    - name: configure-falco
+      taskRef:
+        name: kubernetes-actions
+      params:
+        - name: script
+          value: |
+            kubectl apply -f security/falco/falco_rules.yaml -n $(params.namespace)
+            kubectl rollout restart ds/falco -n falco-system
+      workspaces:
+        - name: source
+          workspace: shared-source
+      runAfter:
+        - deploy-to-cluster
+EOF
+
+# 7. Monitoring
+mkdir -p $TEMP_DIR/monitoring/{prometheus/rules,grafana/dashboards,cloudwatch}
+
+cat > $TEMP_DIR/monitoring/prometheus/prometheus.yml << 'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+rule_files:
+  - "rules/*.yml"
+
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+
+  - job_name: 'kubernetes-nodes'
+    scheme: https
+    tls_config:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      insecure_skip_verify: true
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    kubernetes_sd_configs:
+      - role: node
+EOF
+
+cat > $TEMP_DIR/monitoring/prometheus/rules/app-alerts.yml << 'EOF'
+groups:
+  - name: app_alerts
+    rules:
+      - alert: HighErrorRate
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value }}% for the last 5 minutes"
+
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High latency detected"
+          description: "P95 latency is {{ $value }}s"
+
+      - alert: DatabaseConnectionsLow
+        expr: pg_stat_database_numbackends < 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low database connections"
+          description: "Only {{ $value }} database connections active"
+
+      - alert: PodRestarting
+        expr: increase(kube_pod_container_status_restarts_total[10m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pod is restarting frequently"
+          description: "Pod {{ $labels.pod }} has restarted {{ $value }} times in 10 minutes"
+EOF
+
+# 8. Documentación
+mkdir -p $TEMP_DIR/docs/{architecture,development,operations/runbooks}
+
+cat > $TEMP_DIR/docs/architecture/overview.md << 'EOF'
+# Secure App - Arquitectura
+
+## Visión General
+Aplicación con pipeline CI/CD seguro implementando:
+- **Checkov**: Análisis de IaC
+- **Trivy**: Escaneo de vulnerabilidades en imágenes
+- **SBOM**: Generación de Software Bill of Materials
+- **Cosign**: Firmado de imágenes
+- **Falco**: Runtime security
+- **HPA/VPA**: Escalamiento automático
+
+## Componentes AWS
+- **EKS**: Orquestación de contenedores
+- **RDS PostgreSQL**: Base de datos transaccional
+- **DynamoDB**: Almacenamiento de sesiones y eventos
+- **S3**: Almacenamiento de objetos
+
+## Seguridad
+- **Vault**: Gestión de secretos dinámicos
+- **Sealed Secrets**: Configuración encriptada en git
+- **IRSA**: IAM Roles for Service Accounts
+- **KMS**: Encriptación de datos en reposo
+
+## Flujo de Datos
+1. Cliente → API Gateway → Service (K8s) → App Pod
+2. App Pod → RDS (PostgreSQL) para datos transaccionales
+3. App Pod → DynamoDB para sesiones/estado
+4. App Pod → S3 para archivos estáticos
+EOF
+
+cat > $TEMP_DIR/README.md << 'EOF'
+# Secure App Project
+
+## 📋 Descripción
+Proyecto demo de pipeline CI/CD seguro con Tekton, integrando herramientas de seguridad y despliegue en AWS.
+
+## 🏗️ Estructura del Proyecto
+
+.
+├── docker/ # Configuración Docker y docker-compose
+├── docs/ # Documentación
+├── iac/ # Terraform para infraestructura AWS
+├── k8s/ # Manifiestos Kubernetes
+├── monitoring/ # Configuración de monitoreo
+├── security/ # Configuraciones de seguridad
+├── src/ # Código fuente de la aplicación
+└── tekton/ # Pipelines Tekton
+
+## 🚀 Despliegue Rápido
+```bash
+# 1. Configurar infraestructura
+cd iac/terraform/environments/dev
+terraform init
+terraform apply
+
+# 2. Configurar kubectl
+aws eks update-kubeconfig --region us-east-1 --name dev-app-cluster
+
+# 3. Instalar Tekton
+kubectl apply -f https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
+
+# 4. Aplicar pipelines
+kubectl apply -f tekton/tasks/
+kubectl apply -f tekton/pipelines/
+
+# 5. Ejecutar pipeline
+kubectl apply -f tekton/runs/pipeline-run.yaml
+
+🔐 Gestión de Secretos
+
+    Vault: Credenciales de DB (rotación automática)
+
+    Sealed Secrets: Configuración AWS en git
+
+    IRSA: Permisos AWS para pods
+
+    CSI Secrets Store: Montaje seguro de secretos
+
+📊 Monitoreo
+
+    Prometheus + Grafana para métricas
+
+    CloudWatch para logs
+
+    Falco para alertas de seguridad
+
+🧪 Entornos
+
+    dev: Desarrollo local con docker-compose
+
+    staging: Simulación en AWS (instancias pequeñas)
+
+    prod: Producción completa con HA
+    EOF
+
+Script de migración
+
+cat > $TEMP_DIR/migrate-to-project.sh << 'EOF'
+#!/bin/bash
+Script para migrar archivos generados al proyecto real
+
+PROJECT_DIR="$HOME/projects/security.for.loop"
+TEMP_DIR="/tmp/estructura-proyecto"
+
+echo "📦 Migrando archivos a $PROJECT_DIR"
+Crear estructura si no existe
+
+mkdir -p $PROJECT_DIR
+Función para copiar preservando estructura
+
+copy_with_structure() {
+local src=$1
+local dest=$2
+
+if [ -f "$src" ]; then
+Es un archivo, crear directorio destino y copiar
+
+rel_path="${src#$TEMP_DIR/}"
+target_dir="$dest/$(dirname "$rel_path")"
+mkdir -p "$target_dir"
+cp "$src" "$dest/$rel_path"
+echo " ✅ Copiado: $rel_path"
+fi
+}
+
+export -f copy_with_structure
+Copiar todos los archivos
+
+find $TEMP_DIR -type f -not -path "*/migrate-to-project.sh" | while read file; do
+copy_with_structure "$file" "$PROJECT_DIR"
+done
+
+echo ""
+echo "🎉 Migración completada!"
+echo "📁 Los archivos están en: $PROJECT_DIR"
+echo ""
+echo "Para ver la estructura:"
+echo " cd $PROJECT_DIR && tree -L 3"
+EOF
+
+chmod +x $TEMP_DIR/migrate-to-project.sh
+Copiar todo al directorio del proyecto
+
+echo "📋 Creando estructura final en $PROJECT_DIR..."
+cp -r $TEMP_DIR/* $PROJECT_DIR/ 2>/dev/null || true
+
+echo ""
+echo "✅ ¡Estructura completa generada!"
+echo "📁 Los archivos están en: $PROJECT_DIR"
+echo ""
+echo "Resumen de archivos creados:"
+find $PROJECT_DIR -type f -name ".yaml" -o -name ".yml" -o -name ".tf" -o -name ".py" -o -name "*.md" -o -name "Dockerfile" | head -20
+echo "..."
+echo ""
+echo "Para ver la estructura completa:"
+echo " cd $PROJECT_DIR && tree -L 3"
+echo ""
+echo "Para personalizar los placeholders (AWS account IDs, etc):"
+echo " grep -r "123456789" --include="*.{tf,yaml,md}" $PROJECT_DIR"
+EOF
